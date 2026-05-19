@@ -1,0 +1,22 @@
+{
+  "name": "strikesend",
+  "version": "4.0.0",
+  "description": "StrikeSend — Privacy layer for USDC/EURC on Arc Testnet",
+  "type": "module",
+  "scripts": {
+    "start":         "node relayer.js",
+    "start:circle":  "node circle-wallets-server.js",
+    "start:relayer": "node relayer.js",
+    "bot":           "node bot.js",
+    "bot:quick":     "NUM_SPLITS=1 SPLIT_DELAY_SECS=0 CONCURRENT_PAIRS=1 node bot.js",
+    "bot:stress":    "CONCURRENT_PAIRS=999 NUM_SPLITS=1 node bot.js"
+  },
+  "dependencies": {
+    "@circle-fin/developer-controlled-wallets": "^10.3.1",
+    "@circle-fin/user-controlled-wallets": "^2.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.0",
+    "ethers": "^6.0.0",
+    "express": "^4.18.0"
+  }
+}
