@@ -1,73 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/**
- * ███████╗████████╗██████╗ ██╗██╗  ██╗███████╗███████╗███████╗███╗   ██╗██████╗
- * ██╔════╝╚══██╔══╝██╔══██╗██║██║ ██╔╝██╔════╝██╔════╝██╔════╝████╗  ██║██╔══██╗
- * ███████╗   ██║   ██████╔╝██║█████╔╝ █████╗  ███████╗█████╗  ██╔██╗ ██║██║  ██║
- * ╚════██║   ██║   ██╔══██╗██║██╔═██╗ ██╔══╝  ╚════██║██╔══╝  ██║╚██╗██║██║  ██║
- * ███████║   ██║   ██║  ██║██║██║  ██╗███████╗███████║███████╗██║ ╚████║██████╔╝
- * ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═══╝╚═════╝
- *
- * @title   StrikeSend v3.1 — ERC-20 Privacy Layer (Arc Testnet)
- * @notice  Routes USDC / EURC through a time-delayed, sender-defined split escrow,
- *          breaking the on-chain link between sender and recipient.
- *
- * @dev     v3.1 changes vs v3.0
- *          • Added reclaim() — sender can recover uncollected splits after
- *            RECLAIM_DELAY (30 days), preventing permanent fund loss if secret
- *            is lost or never delivered.
- *          • Added Reclaimed event for indexing.
- *          • Two-step ownership transfer (proposeOwner / acceptOwnership)
- *            replaces single-step transferOwnership, preventing accidental
- *            permanent loss of admin control.
- *
- * ── Arc Testnet specifics ─────────────────────────────────────────────────────
- *  Chain ID : 5042002
- *  Gas token: USDC (native, 18-decimal precision internally; ERC-20 = 6 decimals)
- *  USDC ERC-20: 0x3600000000000000000000000000000000000000
- *  EURC ERC-20: 0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a
- *  Explorer : https://testnet.arcscan.app
- *  Faucet   : https://faucet.circle.com
- *
- * ── Arc EVM differences handled here ─────────────────────────────────────────
- *  1. PREV_RANDAO = 0 always on Arc. This contract does NOT use block.prevrandao,
- *     blockhash(), or any on-chain randomness. Split amounts and delays are
- *     fully sender-specified via SplitParam[]. Safe.
- *  2. Sub-second blocks may share block.timestamp. Release checks use
- *     block.timestamp >= releaseTime (not strict >), so this is safe.
- *  3. No native ETH. Gas is paid in USDC. This contract uses the ERC-20
- *     interface only and reverts on any native value send.
- *  4. Deterministic finality <1s. One confirmation is sufficient.
- *  5. SELFDESTRUCT restricted — not used here.
- *  6. EIP-1559 fee market. Transactions must set maxFeePerGas >= 20 Gwei.
- *
- * ── Flow ──────────────────────────────────────────────────────────────────────
- *  1. Sender generates random secret off-chain → commitment = keccak256(secret).
- *  2. Sender calls token.approve(thisContract, totalAmount).
- *  3. Sender calls strike(token, commitment, splitParams[]).
- *  4. Contract pulls tokens; schedule locked on-chain.
- *  5. Sender sends raw secret to recipient via private channel (Signal, etc.).
- *  6a. Recipient calls collect(secret, i) — pays own gas.
- *  6b. OR recipient signs payload; relayer calls collectFor() — gasless.
- *  7.  If secret lost: sender calls reclaim(commitment) after 30 days
- *      to recover any uncollected splits.
- *
- * ── Privacy properties ────────────────────────────────────────────────────────
- *  • Commitment (hash) on-chain; raw secret revealed only at collect time.
- *  • No sender↔recipient address link stored on-chain.
- *  • Nullifiers prevent double-spending.
- *  • Multiple splits → multiple unrelated-looking transactions.
- *  • collectFor() → recipient never touches the chain.
- *  • reclaim() uses commitment (not secret) — does not break privacy model.
- *
- * ── Deployment ────────────────────────────────────────────────────────────────
- *  Remix: compile with 0.8.20, deploy on Arc Testnet (chainId 5042002):
- *    _owner: 0x0000000000000000000000000000000000000000  (uses msg.sender)
- *    _usdc:  0x3600000000000000000000000000000000000000
- *    _eurc:  0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a
- */
-
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function transfer(address to, uint256 amount) external returns (bool);
@@ -77,47 +10,25 @@ interface IERC20 {
 
 contract StrikeSend {
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Structs
-    // ─────────────────────────────────────────────────────────────────────────
-
     struct Split {
-        uint256 amount;       // 6-decimal ERC-20 token units locked in this split
-        uint256 releaseTime;  // Unix timestamp; collect allowed when block.timestamp >= this
-        bool    collected;    // True once funds have been transferred out
+        uint256 amount;
+        uint256 releaseTime;
+        bool    collected;
     }
 
     struct StrikeData {
-        address token;        // ERC-20 token address (USDC or EURC)
-        address striker;      // Depositor — not revealed during collect
-        uint256 totalAmount;  // Sum of all split amounts
-        uint256 numSplits;    // Length of the split schedule
-        uint256 timestamp;    // block.timestamp at deposit
-        bool    exists;       // Prevents commitment reuse
+        address token;
+        address striker;
+        uint256 totalAmount;
+        uint256 numSplits;
+        uint256 timestamp;
+        bool    exists;
     }
 
-    /**
-     * @dev  Input type for each split in a strike() call.
-     *
-     *  amount       — token units in 6-decimal ERC-20 terms.
-     *                 Example: 1_000_000 = 1 USDC / 1 EURC.
-     *
-     *  delaySeconds — seconds from block.timestamp until this split is collectable.
-     *                 0 = immediately collectable.
-     *                 Max = 604800 (7 days).
-     *
-     *  Frontend note: the UI stores delays as milliseconds (delayMs).
-     *  The hook must convert: delaySeconds = Math.floor(split.delayMs / 1000)
-     *  before encoding the transaction.
-     */
     struct SplitParam {
         uint256 amount;
         uint256 delaySeconds;
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Storage
-    // ─────────────────────────────────────────────────────────────────────────
 
     mapping(bytes32 => StrikeData)                 public strikes;
     mapping(bytes32 => mapping(uint256 => Split))  public splits;
@@ -125,20 +36,12 @@ contract StrikeSend {
     mapping(address => bool)                       public tokenAllowed;
 
     address public owner;
-    address public proposedOwner; // v3.1: two-step ownership transfer
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Constants
-    // ─────────────────────────────────────────────────────────────────────────
+    address public proposedOwner;
 
     uint256 public constant MAX_SPLITS      = 7;
-    uint256 public constant MAX_DELAY       = 7 days;   // 604 800 seconds
-    uint256 public constant MAX_RELAYER_FEE = 500;      // 5 % in basis points
-    uint256 public constant RECLAIM_DELAY   = 30 days;  // v3.1: sender reclaim window
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Events
-    // ─────────────────────────────────────────────────────────────────────────
+    uint256 public constant MAX_DELAY       = 7 days;
+    uint256 public constant MAX_RELAYER_FEE = 500;
+    uint256 public constant RECLAIM_DELAY   = 30 days;
 
     event TokenAllowed(address indexed token, bool allowed);
 
@@ -158,7 +61,6 @@ contract StrikeSend {
         uint256 releaseTime
     );
 
-    // relayer == address(0) for direct collect / collectAll
     event Collected(
         bytes32 indexed commitment,
         uint256 splitIndex,
@@ -170,7 +72,6 @@ contract StrikeSend {
         uint256 timestamp
     );
 
-    // v3.1: emitted when sender reclaims uncollected splits
     event Reclaimed(
         bytes32 indexed commitment,
         address indexed striker,
@@ -179,23 +80,14 @@ contract StrikeSend {
         uint256 timestamp
     );
 
-    // v3.1: two-step ownership events
     event OwnershipProposed(address indexed proposedOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Constructor
-    // ─────────────────────────────────────────────────────────────────────────
 
     constructor(address _owner, address _usdc, address _eurc) {
         owner = (_owner == address(0)) ? msg.sender : _owner;
         if (_usdc != address(0)) { tokenAllowed[_usdc] = true; emit TokenAllowed(_usdc, true); }
         if (_eurc != address(0)) { tokenAllowed[_eurc] = true; emit TokenAllowed(_eurc, true); }
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Admin
-    // ─────────────────────────────────────────────────────────────────────────
 
     modifier onlyOwner() {
         require(msg.sender == owner, "StrikeSend: not owner");
@@ -207,31 +99,18 @@ contract StrikeSend {
         emit TokenAllowed(token, allowed);
     }
 
-    /**
-     * @notice  v3.1: Step 1 of two-step ownership transfer.
-     *          Proposes a new owner; they must call acceptOwnership() to confirm.
-     *          Prevents accidental permanent loss of admin control.
-     */
     function proposeOwner(address newOwner) external onlyOwner {
         require(newOwner != address(0), "StrikeSend: zero address");
         proposedOwner = newOwner;
         emit OwnershipProposed(newOwner);
     }
 
-    /**
-     * @notice  v3.1: Step 2 of two-step ownership transfer.
-     *          Must be called by the proposed new owner to accept control.
-     */
     function acceptOwnership() external {
         require(msg.sender == proposedOwner, "StrikeSend: not proposed owner");
         emit OwnershipTransferred(owner, proposedOwner);
         owner         = proposedOwner;
         proposedOwner = address(0);
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // strike()
-    // ─────────────────────────────────────────────────────────────────────────
 
     function strike(
         address           token,
@@ -251,8 +130,6 @@ contract StrikeSend {
             total += params[i].amount;
         }
 
-        // Pull tokens. Arc enforces USDC blocklist pre-mempool and at runtime;
-        // if sender is blocklisted, transferFrom reverts here.
         require(IERC20(token).transferFrom(msg.sender, address(this), total),
                 "StrikeSend: transferFrom failed");
 
@@ -278,10 +155,6 @@ contract StrikeSend {
         emit Struck(commitment, token, msg.sender, total, params.length, block.timestamp);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // collect()  — direct (caller pays USDC gas)
-    // ─────────────────────────────────────────────────────────────────────────
-
     function collect(bytes32 secret, uint256 splitIndex) external {
         bytes32 commitment = _toCommitment(secret);
 
@@ -303,10 +176,6 @@ contract StrikeSend {
 
         require(IERC20(token).transfer(msg.sender, s.amount), "StrikeSend: transfer failed");
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // collectAll()  — batch all matured splits
-    // ─────────────────────────────────────────────────────────────────────────
 
     function collectAll(bytes32 secret) external {
         bytes32 commitment = _toCommitment(secret);
@@ -330,10 +199,6 @@ contract StrikeSend {
         require(payout > 0, "StrikeSend: nothing collectable yet");
         require(IERC20(token).transfer(msg.sender, payout), "StrikeSend: transfer failed");
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // collectFor()  — gasless via relayer
-    // ─────────────────────────────────────────────────────────────────────────
 
     function collectFor(
         bytes32        secret,
@@ -375,27 +240,6 @@ contract StrikeSend {
         require(IERC20(token).transfer(recipient, payout), "StrikeSend: payout transfer failed");
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // reclaim()  — v3.1: sender recovers uncollected splits after 30 days
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /**
-     * @notice  Allows the original striker to recover any uncollected splits
-     *          after RECLAIM_DELAY (30 days) has passed since the strike.
-     *
-     * @dev     Safety properties:
-     *          • Only callable by the original striker address.
-     *          • Only after 30 days — gives recipients a generous collection window.
-     *          • Only refunds splits not yet collected — already-collected splits
-     *            are unaffected; the recipient keeps what they already took.
-     *          • Uses commitment (not secret) — privacy model is preserved;
-     *            no new on-chain link between striker and recipient is created.
-     *          • Nullifiers marked spent so splits cannot be double-claimed
-     *            if reclaim() and collect() race (collect wins if it lands first).
-     *
-     * @param   commitment  The keccak256 hash of the secret (same value emitted
-     *                      in the Struck event at deposit time).
-     */
     function reclaim(bytes32 commitment) external {
         StrikeData storage sd = strikes[commitment];
 
@@ -403,7 +247,7 @@ contract StrikeSend {
         require(msg.sender == sd.striker, "StrikeSend: not striker");
         require(
             block.timestamp >= sd.timestamp + RECLAIM_DELAY,
-            "StrikeSend: reclaim too early — wait 30 days from deposit"
+            "StrikeSend: reclaim too early: wait 30 days from deposit"
         );
 
         uint256 refund = 0;
@@ -413,7 +257,6 @@ contract StrikeSend {
             Split storage s   = splits[commitment][i];
             bytes32 nullifier = keccak256(abi.encodePacked(commitment, i));
 
-            // Skip splits already collected by the recipient
             if (!s.collected && !nullifiers[nullifier]) {
                 nullifiers[nullifier] = true;
                 s.collected = true;
@@ -428,10 +271,6 @@ contract StrikeSend {
 
         require(IERC20(token).transfer(msg.sender, refund), "StrikeSend: reclaim transfer failed");
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // View helpers
-    // ─────────────────────────────────────────────────────────────────────────
 
     function getSplits(bytes32 secret)
         external view
@@ -471,19 +310,11 @@ contract StrikeSend {
         }
     }
 
-    /**
-     * @notice  Returns the unix timestamp after which reclaim() becomes callable.
-     *          Returns 0 if the commitment does not exist.
-     */
     function reclaimAvailableAt(bytes32 commitment) external view returns (uint256) {
         if (!strikes[commitment].exists) return 0;
         return strikes[commitment].timestamp + RECLAIM_DELAY;
     }
 
-    /**
-     * @notice  Payload the recipient must EIP-191 sign to authorise collectFor().
-     *          Chain-ID bound (5042002) — prevents cross-chain replay.
-     */
     function collectPayload(
         bytes32 secret,
         uint256 splitIndex,
@@ -504,15 +335,10 @@ contract StrikeSend {
         return _toCommitment(secret);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Internal
-    // ─────────────────────────────────────────────────────────────────────────
-
     function _toCommitment(bytes32 secret) internal pure returns (bytes32) {
         return keccak256(abi.encodePacked(secret));
     }
 
-    /// @dev EIP-191 personal_sign recovery — matches ethers.js signMessage(getBytes(payload))
     function _recoverSigner(bytes32 payload, bytes calldata sig) internal pure returns (address) {
         require(sig.length == 65, "StrikeSend: bad sig length");
         bytes32 ethHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", payload));
@@ -529,6 +355,5 @@ contract StrikeSend {
         return ecrecover(ethHash, v, r, s);
     }
 
-    /// @dev Reject native USDC sends — use strike() with ERC-20 transferFrom.
     receive() external payable { revert("StrikeSend: use strike()"); }
 }
