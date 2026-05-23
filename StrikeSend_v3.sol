@@ -264,7 +264,7 @@ contract StrikeSend {
             }
         }
 
-        require(refund > 0, "StrikeSend: nothing to reclaim — all splits already collected");
+        require(refund > 0, "StrikeSend: nothing to reclaim: all splits already collected");
 
         address token = sd.token;
         emit Reclaimed(commitment, msg.sender, token, refund, block.timestamp);
